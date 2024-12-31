@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Upgrade
+Type = Package
+Target = *
+
+[Action]
+Description = Creating ZFS snapshot before upgrade...
+Depends = zfs-utils
+When = PreTransaction
+Exec = /usr/bin/zfs-autosnap
+AbortOnFail
