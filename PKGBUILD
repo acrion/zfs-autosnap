@@ -2,10 +2,10 @@
 
 pkgname=zfs-autosnap
 pkgver=1.02
-pkgrel=1
+pkgrel=2
 pkgdesc="zfs auto-snapshot script which runs before package upgrade using Pacman hook."
 arch=("any")
-url="https://gitlab.com/acrion/zfs-autosnap"
+url="https://github.com/acrion/zfs-autosnap"
 license=('AGPL-3.0-or-later')
 depends=('zfs-utils')
 source=(
@@ -28,4 +28,3 @@ package() {
     install -Dm755 zfs-autosnap ${pkgdir}/usr/bin/zfs-autosnap
     install -Dm644 LICENSE ${pkgdir}/usr/share/licenses/${pkgname}/LICENSE
 }
- 
