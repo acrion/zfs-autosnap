@@ -14,7 +14,7 @@ This Arch Linux package automatically creates and manages ZFS snapshots before s
   Deletes older snapshots beyond a user-defined limit to keep your snapshot history uncluttered.  
 
 - **Pacman lock file handling**  
-  Temporarily removes the Pacman lock file (/var/lib/pacman/db.lck) to prevent it from being included in a ZFS snapshot.  
+  Shifts the Pacman lock file (`/var/lib/pacman/db.lck`) to the side for the duration of the snapshot, ensuring that a system reverted to that snapshot does not come back holding a lock belonging to nobody. The file is put back promptly once the snapshot is established, and it is removed instead of reinstated if Pacman itself fails to survive the snapshot. Within the snapshot the lock exists under the name `db.lck.zfs-autosnap`, which Pacman ignores and which may be erased post-rollback.  
 
 - **Configurable behavior**  
   The `/etc/zfs-autosnap.conf` file allows you to enable or disable snapshot creation, set custom dataset names, limit the number of snapshots, and more.

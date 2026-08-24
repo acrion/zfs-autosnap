@@ -24,7 +24,9 @@
 
 [[ -v SKIP_AUTOSNAP ]] && { echo "==> skipping zfs-autosnap because SKIP_AUTOSNAP environment variable being set."; exit 0; }
 
-readonly CONF_FILE=/etc/zfs-autosnap.conf
+# Overridable so that the test suite can supply a configuration of its own
+# instead of the one installed on the machine.
+readonly CONF_FILE=${ZFS_AUTOSNAP_CONF:-/etc/zfs-autosnap.conf}
 
 get_property() {
     if [[ ! -f $CONF_FILE ]]; then
@@ -61,28 +63,104 @@ if ! zfs list "${DATASET}" >/dev/null 2>&1; then
 fi
 
 readonly SNAPSHOT_NAME="autosnap_$(date '+%Y-%m-%d_%H-%M-%S')"
-readonly LOCKFILE=$(mktemp -u /tmp/db.lck.XXXXXX)
 
-cleanup_and_exit() {
-    if [[ -f "$LOCKFILE" ]]; then
-        mv "$LOCKFILE" /var/lib/pacman/db.lck
-        echo "==> Restored pacman lock file."
-    fi
-    exit "$1"
+# The pacman database directory and the two names its lock file assumes while
+# a snapshot is being made. Both are overridable so that the test suite can
+# run this script against a directory of its own rather than the machine's
+# package database.
+readonly PACMAN_DB_DIR=${ZFS_AUTOSNAP_PACMAN_DB_DIR:-/var/lib/pacman}
+readonly PACMAN_LOCK="$PACMAN_DB_DIR/db.lck"
+
+# The lock is set aside beside itself rather than in /tmp. /tmp is a distinct
+# file system on most installations, so relocating there involves a copy and an
+# unlink instead of a rename: it is not atomic, it does not preserve the inode,
+# and it can fail mid-operation. Within a single directory, rename(2) avoids
+# all of that. The name ultimately appears in the snapshot, but an empty file
+# that pacman never examines is harmless in that context, which is precisely
+# what db.lck itself would not be.
+readonly LOCK_ASIDE="$PACMAN_LOCK.zfs-autosnap"
+
+# The process initiating this hook is the pacman that holds the lock and that
+# will remove it again when its transaction concludes. Its identity is read
+# now, while it is certainly there.
+readonly INVOKER_PID=$PPID
+
+# The start time of the invoking process, or nothing if it is gone or has died
+# and is only waiting to be reaped. A process number alone is not an identity,
+# because the number is reused; together with the start time it is one.
+invoker_start_time() {
+    local line rest fields
+    [[ -r /proc/$INVOKER_PID/stat ]] || return 1
+    read -r line < "/proc/$INVOKER_PID/stat" || return 1
+    # The line reads "pid (name) state ...", and the name may itself contain
+    # blanks and brackets, so the fields are counted from the last bracket.
+    rest=${line##*') '}
+    read -ra fields <<<"$rest"
+    [[ ${fields[0]} == "Z" ]] && return 1
+    printf '%s\n' "${fields[19]}"
 }
 
-trap 'cleanup_and_exit $?' EXIT
+readonly INVOKER_START_TIME=$(invoker_start_time)
 
-if [[ -f /var/lib/pacman/db.lck ]]; then
-    mv /var/lib/pacman/db.lck "$LOCKFILE"
+invoker_is_alive() {
+    # Without /proc there is nothing to go by, and guessing that the invoker is
+    # gone would strip the lock from a pacman that is still using it.
+    [[ -z $INVOKER_START_TIME ]] && return 0
+    [[ $(invoker_start_time) == "$INVOKER_START_TIME" ]]
+}
+
+put_lock_aside() {
+    [[ -e $PACMAN_LOCK ]] || return 0
+    mv "$PACMAN_LOCK" "$LOCK_ASIDE"
     echo "==> Temporarily removed pacman lock file to avoid inclusion in the snapshot."
-fi
+}
+
+restore_lock() {
+    [[ -e $LOCK_ASIDE ]] || return 0
+
+    if ! invoker_is_alive; then
+        # pacman ceased while the lock was aside: interrupted, killed or
+        # crashed. It removes its lock upon termination, and it did so at a
+        # moment when the file was not where it expected it. Putting the file
+        # back now would leave a lock that belongs to no process and that
+        # nothing will ever remove, so every later pacman waits for a
+        # transaction that is long over, and only a manual rm gets the machine
+        # out of it again.
+        rm -f "$LOCK_ASIDE"
+        echo "==> pacman ended while the snapshot was being made; discarded its lock file rather than leaving it behind." >&2
+        return 0
+    fi
+
+    if [[ -e $PACMAN_LOCK ]]; then
+        echo "==> Warning: another process created $PACMAN_LOCK while the snapshot was being made." >&2
+    fi
+
+    mv "$LOCK_ASIDE" "$PACMAN_LOCK"
+    echo "==> Restored pacman lock file."
+}
+
+trap restore_lock EXIT
+
+# A hook that is interrupted is exactly the case the lock handling has to
+# survive, and bash leaves the exit status of an interrupted script at 0, which
+# tells pacman the hook succeeded. Naming the status here makes the interruption
+# visible to AbortOnFail.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+put_lock_aside
 
 echo "==> Creating ZFS-Snapshot ${DATASET}@${SNAPSHOT_NAME}"
 if ! zfs snapshot "${DATASET}@${SNAPSHOT_NAME}"; then
     echo "Could not create ZFS snapshot." >&2
     exit 1
 fi
+
+# As early as this: nothing keeps a second pacman from starting a transaction
+# while the lock is aside, so the interval between the two moves is kept to the
+# one call that has to see the file system without the lock. Setting the
+# description and deleting old snapshots change no file, so they run afterwards.
+restore_lock
 
 zfs set autosnap:description="${SNAPSHOT_DESCRIPTION}" "${DATASET}@${SNAPSHOT_NAME}"
 
