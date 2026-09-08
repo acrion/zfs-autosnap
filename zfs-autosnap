@@ -109,14 +109,36 @@ invoker_is_alive() {
     [[ $(invoker_start_time) == "$INVOKER_START_TIME" ]]
 }
 
+# Whether this run is the one that put the lock under the aside name. The name
+# is fixed, so its simple existence says nothing about who owns it: a run that
+# was terminated abruptly, or that lost power, never reached its trap and left
+# the file behind, and a system rolled back into one of these snapshots carries
+# the file by construction. Such a file belongs to no pacman, and moving it back
+# would produce precisely the lock without an owner that this handling is meant
+# to prevent.
+LOCK_MOVED_ASIDE=false
+
 put_lock_aside() {
     [[ -e $PACMAN_LOCK ]] || return 0
-    mv "$PACMAN_LOCK" "$LOCK_ASIDE"
+    mv "$PACMAN_LOCK" "$LOCK_ASIDE" || return 1
+    LOCK_MOVED_ASIDE=true
     echo "==> Temporarily removed pacman lock file to avoid inclusion in the snapshot."
 }
 
 restore_lock() {
     [[ -e $LOCK_ASIDE ]] || return 0
+
+    if [[ $LOCK_MOVED_ASIDE != true ]]; then
+        rm -f "$LOCK_ASIDE"
+        echo "==> Removed $LOCK_ASIDE, which was left over from an earlier run and belongs to no pacman." >&2
+        return 0
+    fi
+
+    # From here on the file belongs to this run, and whatever happens to it,
+    # this run holds nothing aside thereafter. Stating this keeps the trap at
+    # the end of the script from picking up a second file with the same name for
+    # itself.
+    LOCK_MOVED_ASIDE=false
 
     if ! invoker_is_alive; then
         # pacman ceased while the lock was aside: interrupted, killed or

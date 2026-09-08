@@ -74,6 +74,10 @@ case $1 in
         # the deletion is visible in the record above.
         if [[ $2 == -t ]]; then
             for i in 1 2 3 4 5; do echo "testpool/ROOT/default@autosnap_$i"; done
+        else
+            # The check that the dataset exists, which is the final action
+            # the script performs before it records who invoked it.
+            [[ -n ${STUB_LIST_HOOK:-} ]] && "$STUB_LIST_HOOK"
         fi
         ;;
 esac
@@ -157,6 +161,34 @@ fake-pacman &
 kill -STOP $$
 EOF
 
+    # An invoker that does not outlive the hook it started. The script is an
+    # ordinary command in /usr/bin, so this is a plain run of it by something
+    # that then ends; an upgrade whose pacman is killed the instant after it
+    # forks the hook arrives at the same place.
+    cat > "$WORK/bin/vanishing-invoker" <<'EOF'
+#!/usr/bin/env bash
+echo $$ >"$WORK/invoker.pid"
+bash "$SCRIPT" >"$WORK/hook.out" 2>&1 &
+echo $! >"$WORK/hook.pid"
+# Not before the hook is running and waiting for this process to go, because
+# the hook would otherwise read a start time while there still is one.
+deadline=$((SECONDS + 30))
+while [[ ! -e $WORK/in-list ]] && ((SECONDS < deadline)); do sleep 0.02; done
+EOF
+
+    # Runs inside the stubbed check that the dataset exists, which the script
+    # makes before it looks its invoker up. It holds the hook there until the
+    # invoker has not only died but been collected, so that the number the hook
+    # recorded at startup no longer has an entry under /proc.
+    cat > "$WORK/bin/before-invoker-lookup" <<'EOF'
+#!/usr/bin/env bash
+touch "$WORK/in-list"
+invoker=$(<"$WORK/invoker.pid")
+deadline=$((SECONDS + 30))
+while [[ -e /proc/$invoker ]] && ((SECONDS < deadline)); do sleep 0.02; done
+[[ -e /proc/$invoker ]] || printf 'gone\n' >"$WORK/invoker.state"
+EOF
+
     chmod +x "$WORK"/bin/*
 }
 
@@ -206,8 +238,39 @@ wait_for_hook() {
     [ "$before" = "$after" ]
 }
 
+@test "a lock this run put aside is restored although a left-over file was in the way" {
+    # The other side of the distinction the test below draws: discarding a file
+    # that belongs to nobody must not cost a live pacman its lock. Which of the
+    # two files came back cannot be seen from the name, so the inode settles it.
+    : >"$LOCK"
+    printf 'left over\n' >"$ASIDE"
+    local before after
+    before=$(stat -c %i "$LOCK")
+    run bash "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [ -e "$LOCK" ]
+    [ ! -e "$ASIDE" ]
+    after=$(stat -c %i "$LOCK")
+    [ "$before" = "$after" ]
+}
+
 @test "a run without a pacman lock does not invent one" {
     # The script is an ordinary command in /usr/bin and can be run by hand.
+    run bash "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [ ! -e "$LOCK" ]
+    [ ! -e "$ASIDE" ]
+}
+
+@test "a left-over aside file is removed rather than turned into a lock" {
+    # The aside name is fixed, so the file is already there whenever an earlier
+    # run never reached its trap: killed by SIGKILL, by the OOM killer or by the
+    # power going. A system rolled back into one of these snapshots has it by
+    # construction, because the snapshot was taken while the lock was aside.
+    # Until this test existed, the next run moved that file to db.lck and left
+    # behind a lock that no pacman had ever taken -- exactly the failure of
+    # 2026-08-22, now reached from a directory that was not empty to begin with.
+    : >"$ASIDE"
     run bash "$SCRIPT"
     [ "$status" -eq 0 ]
     [ ! -e "$LOCK" ]
@@ -239,6 +302,28 @@ wait_for_hook() {
     echo $! >"$WORK/reaperless.pid"
     disown
     wait_for_hook
+    [ ! -e "$LOCK" ]
+    [ ! -e "$ASIDE" ]
+}
+
+@test "a left-over aside file is not restored when the invoker cannot be identified" {
+    # The hook answers "alive" whenever it can read no start time for its
+    # invoker at all, because guessing "gone" would strip a working pacman of
+    # its lock. An invoker that ends before the hook gets round to looking it up
+    # therefore counts as alive, and until this test was in place that answer
+    # alone was enough to move a left-over file into place as a lock. What
+    # decides it is not whether anyone is alive but whether this run put the
+    # file there.
+    : >"$ASIDE"
+    export STUB_LIST_HOOK="$WORK/bin/before-invoker-lookup"
+    run vanishing-invoker
+    wait_for_hook
+    # Dead and collected, so the number the hook holds has no entry under /proc
+    # and yields no start time at all. Asserted rather than assumed: had the
+    # wait run out, the hook would have looked up an invoker that was still
+    # there and this would only repeat the test above.
+    [ "$(<"$WORK/invoker.state")" = gone ]
+    grep -qx 'snapshot lock=absent aside=present' "$STUB_LOG"
     [ ! -e "$LOCK" ]
     [ ! -e "$ASIDE" ]
 }
